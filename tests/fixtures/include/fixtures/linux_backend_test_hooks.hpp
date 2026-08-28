@@ -120,6 +120,16 @@ namespace lvh::detail::test {
      * @brief Product name carried by the observed create event.
      */
     std::string name;
+
+    /**
+     * @brief Physical path carried by the observed create event.
+     */
+    std::string physical_id;
+
+    /**
+     * @brief Unique identity carried by the observed create event.
+     */
+    std::string unique_id;
   };
 
   /**
@@ -135,6 +145,51 @@ namespace lvh::detail::test {
      * @brief Last output callback payload.
      */
     GamepadOutput last;
+
+    /**
+     * @brief Ordinary-rumble output observed during the round trip.
+     */
+    std::optional<GamepadOutput> rumble;
+
+    /**
+     * @brief Independent trigger-rumble output observed during the round trip.
+     */
+    std::optional<GamepadOutput> trigger_rumble;
+  };
+
+  /**
+   * @brief Xbox GIP transport observations from a socketpair-backed UHID test.
+   */
+  struct LinuxUhidXboxObservation {
+    /**
+     * @brief Whether UHID creation used the vendor transport descriptor.
+     */
+    bool saw_transport_descriptor = false;
+
+    /**
+     * @brief Whether the transport advertises a HIDAPI-visible Game Pad application usage.
+     */
+    bool saw_gamepad_application_usage = false;
+
+    /**
+     * @brief Whether opening the UHID device produced a GIP hello packet.
+     */
+    bool saw_hello = false;
+
+    /**
+     * @brief Whether a host metadata request produced motor-capability metadata.
+     */
+    bool saw_metadata = false;
+
+    /**
+     * @brief Whether submitted normalized state was carried in a GIP input packet.
+     */
+    bool saw_input = false;
+
+    /**
+     * @brief Whether the Guide button was carried in its GIP system packet.
+     */
+    bool saw_guide = false;
   };
 
   /**
@@ -280,6 +335,11 @@ namespace lvh::detail::test {
      * @brief Switch Pro protocol observations.
      */
     LinuxUhidSwitchProObservation switch_pro;
+
+    /**
+     * @brief Xbox GIP protocol observations.
+     */
+    LinuxUhidXboxObservation xbox;
 
     /**
      * @brief Whether the peer observed a set-report reply.
@@ -878,6 +938,38 @@ namespace lvh::detail::test {
    * @return Round-trip result.
    */
   LinuxUhidRoundTripResult linux_uhid_socketpair_roundtrip();
+
+  /**
+   * @brief Exercise an Xbox profile's GIP handshake, input, and four-motor output through a socketpair.
+   *
+   * @param kind Xbox One or Xbox Series profile kind.
+   * @return Captured lifecycle and protocol observations.
+   */
+  LinuxUhidRoundTripResult linux_xbox_gip_uhid_socketpair_reports(GamepadProfileKind kind);
+
+  /**
+   * @brief Check whether the Linux backend prefers UHID for a gamepad profile.
+   *
+   * @param kind Gamepad profile kind.
+   * @return `true` when Linux attempts UHID before any fallback.
+   */
+  bool linux_gamepad_prefers_uhid(GamepadProfileKind kind);
+
+  /**
+   * @brief Check whether the Linux backend supports a gamepad profile through uinput.
+   *
+   * @param kind Gamepad profile kind.
+   * @return `true` when the profile can be created through uinput.
+   */
+  bool linux_gamepad_uses_uinput(GamepadProfileKind kind);
+
+  /**
+   * @brief Get the effective profile exposed by a Linux uinput fallback.
+   *
+   * @param kind Gamepad profile kind.
+   * @return Effective uinput profile.
+   */
+  DeviceProfile linux_uinput_effective_gamepad_profile(GamepadProfileKind kind);
 
   /**
    * @brief Exercise Switch Pro UHID input, output, and subcommand replies over a socketpair.

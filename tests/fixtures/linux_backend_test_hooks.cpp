@@ -738,6 +738,8 @@ namespace lvh::detail::test {
                                      event.u.create2.product == options.profile.product_id &&
                                      event.u.create2.bus == expected_bus;
         result.creation.name = reinterpret_cast<const char *>(event.u.create2.name);
+        result.creation.physical_id = reinterpret_cast<const char *>(event.u.create2.phys);
+        result.creation.unique_id = reinterpret_cast<const char *>(event.u.create2.uniq);
       }
       return event;
     }
@@ -1586,6 +1588,181 @@ namespace lvh::detail::test {
     return result;
   }
 
+  LinuxUhidRoundTripResult linux_xbox_gip_uhid_socketpair_reports(GamepadProfileKind kind) {
+    LinuxUhidRoundTripResult result;
+    std::array<int, 2> descriptors {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors.data()) != 0) {
+      result.create_status = system_error_status(ErrorCode::backend_failure, "failed to create socketpair", errno);
+      result.submit_status = result.create_status;
+      result.close_status = result.create_status;
+      return result;
+    }
+
+    const auto profile = profiles::gamepad_profile(kind).value();
+    CreateGamepadOptions options;
+    options.profile = profile;
+    options.metadata.stable_id = "xbox-gip-uhid-roundtrip";
+
+    UhidGamepad gamepad {descriptors[0]};
+    auto event = create_started_profile_uhid_gamepad(gamepad, 13, options, descriptors[1], BUS_BLUETOOTH, result);
+    if (result.creation.saw_create) {
+      result.xbox.saw_transport_descriptor =
+        event.u.create2.rd_size == xbox_gip_uhid_report_descriptor.size() &&
+        std::equal(
+          xbox_gip_uhid_report_descriptor.begin(),
+          xbox_gip_uhid_report_descriptor.end(),
+          event.u.create2.rd_data
+        );
+      result.xbox.saw_gamepad_application_usage =
+        event.u.create2.rd_size >= 4U && event.u.create2.rd_data[0] == 0x05U &&
+        event.u.create2.rd_data[1] == 0x01U && event.u.create2.rd_data[2] == 0x09U &&
+        event.u.create2.rd_data[3] == 0x05U;
+    }
+
+    std::atomic_size_t callback_count {0};
+    gamepad.set_output_callback([&result, &callback_count](const GamepadOutput &output) {
+      result.output.last = output;
+      if (output.kind == GamepadOutputKind::rumble) {
+        result.output.rumble = output;
+      } else if (output.kind == GamepadOutputKind::trigger_rumble) {
+        result.output.trigger_rumble = output;
+      }
+      ++callback_count;
+    });
+
+    event = {};
+    event.type = UHID_OPEN;
+    static_cast<void>(write_uhid_event(descriptors[1], event));
+    if (read_uhid_event_type(descriptors[1], UHID_INPUT2, event)) {
+      const auto packet = parse_gip_packet(std::span {event.u.input2.data, event.u.input2.size});
+      result.xbox.saw_hello = packet && packet->command == gip_command_hello &&
+                              (packet->flags & gip_flag_system) != 0U && packet->payload.size() == 28U &&
+                              read_u16_le(packet->payload, 8U) == profile.vendor_id &&
+                              read_u16_le(packet->payload, 10U) == profile.product_id;
+    }
+
+    event = {};
+    event.type = UHID_OUTPUT;
+    event.u.output.rtype = UHID_OUTPUT_REPORT;
+    event.u.output.size = 4;
+    event.u.output.data[0] = gip_command_metadata;
+    event.u.output.data[1] = gip_flag_system;
+    event.u.output.data[2] = 0x31;
+    event.u.output.data[3] = 0;
+    static_cast<void>(write_uhid_event(descriptors[1], event));
+    if (read_uhid_event_type(descriptors[1], UHID_INPUT2, event)) {
+      const auto packet = parse_gip_packet(std::span {event.u.input2.data, event.u.input2.size});
+      result.xbox.saw_metadata = packet && packet->command == gip_command_metadata &&
+                                 (packet->flags & gip_flag_system) != 0U && packet->sequence == 0x31 &&
+                                 packet->payload.size() == 48U && packet->payload[32] == 1U &&
+                                 packet->payload[35] == gip_command_direct_motor &&
+                                 read_u16_le(packet->payload, 36U) == 9U && packet->payload[40] == 0x08U;
+    }
+
+    event = {};
+    event.type = UHID_OUTPUT;
+    event.u.output.rtype = UHID_OUTPUT_REPORT;
+    event.u.output.size = 5;
+    event.u.output.data[0] = gip_command_set_device_state;
+    event.u.output.data[1] = gip_flag_system;
+    event.u.output.data[2] = 0x32;
+    event.u.output.data[3] = 1;
+    event.u.output.data[4] = gip_device_state_start;
+    static_cast<void>(write_uhid_event(descriptors[1], event));
+    static_cast<void>(read_uhid_event_type(descriptors[1], UHID_INPUT2, event));
+
+    GamepadState state;
+    state.buttons.set(GamepadButton::a);
+    state.buttons.set(GamepadButton::start);
+    state.buttons.set(GamepadButton::dpad_right);
+    state.buttons.set(GamepadButton::left_shoulder);
+    state.buttons.set(GamepadButton::left_stick);
+    state.buttons.set(GamepadButton::guide);
+    state.left_stick = {.x = 1.0F, .y = -1.0F};
+    state.right_stick = {.x = 0.5F, .y = -0.5F};
+    state.left_trigger = 0.25F;
+    state.right_trigger = 0.75F;
+    const auto report = reports::pack_input_report(profile, state);
+    result.submit_status = gamepad.submit(state, report);
+
+    for (auto packets_remaining = 2; packets_remaining > 0; --packets_remaining) {
+      if (!read_uhid_event_type(descriptors[1], UHID_INPUT2, event)) {
+        break;
+      }
+      const auto packet = parse_gip_packet(std::span {event.u.input2.data, event.u.input2.size});
+      if (!packet) {
+        continue;
+      }
+      if (packet->command == gip_command_guide_button) {
+        result.xbox.saw_guide = (packet->flags & gip_flag_system) != 0U && packet->payload.size() == 2U &&
+                                packet->payload[0] == 1U && packet->payload[1] == gip_guide_virtual_key;
+      } else if (packet->command == gip_command_input) {
+        result.xbox.saw_input = packet->flags == 0U && packet->payload.size() == 14U &&
+                                packet->payload[0] == 0x14U && packet->payload[1] == 0x58U &&
+                                read_u16_le(packet->payload, 2U) == read_u16_le(report, 8U) &&
+                                read_u16_le(packet->payload, 4U) == read_u16_le(report, 10U) &&
+                                read_u16_le(packet->payload, 6U) ==
+                                  static_cast<std::uint16_t>(read_u16_le(report, 0U) - 0x8000U) &&
+                                read_u16_le(packet->payload, 8U) ==
+                                  static_cast<std::uint16_t>(read_u16_le(report, 2U) - 0x8000U) &&
+                                read_u16_le(packet->payload, 10U) ==
+                                  static_cast<std::uint16_t>(read_u16_le(report, 4U) - 0x8000U) &&
+                                read_u16_le(packet->payload, 12U) ==
+                                  static_cast<std::uint16_t>(read_u16_le(report, 6U) - 0x8000U);
+      }
+    }
+    result.saw_input = result.xbox.saw_input;
+
+    constexpr std::array<std::uint8_t, 13> motor_packet {
+      gip_command_direct_motor,
+      0x00,
+      0x33,
+      0x09,
+      0x00,
+      0x0F,
+      25,
+      50,
+      75,
+      100,
+      10,
+      0,
+      0,
+    };
+    event = {};
+    event.type = UHID_OUTPUT;
+    event.u.output.rtype = UHID_OUTPUT_REPORT;
+    event.u.output.size = static_cast<__u16>(motor_packet.size());
+    std::copy(motor_packet.begin(), motor_packet.end(), event.u.output.data);
+    static_cast<void>(write_uhid_event(descriptors[1], event));
+
+    const auto output_deadline = std::chrono::steady_clock::now() + std::chrono::seconds {1};
+    while (std::chrono::steady_clock::now() < output_deadline && callback_count.load() < 2U) {
+      std::this_thread::sleep_for(std::chrono::milliseconds {10});
+    }
+    result.output.callback_count = callback_count.load();
+
+    result.close_status = gamepad.close();
+    if (read_uhid_event_type(descriptors[1], UHID_DESTROY, event)) {
+      result.saw_destroy = true;
+    }
+
+    static_cast<void>(::close(descriptors[1]));
+    return result;
+  }
+
+  bool linux_gamepad_prefers_uhid(GamepadProfileKind kind) {
+    return prefers_uhid_gamepad_profile(kind);
+  }
+
+  bool linux_gamepad_uses_uinput(GamepadProfileKind kind) {
+    return uses_uinput_gamepad_profile(kind);
+  }
+
+  DeviceProfile linux_uinput_effective_gamepad_profile(GamepadProfileKind kind) {
+    const auto requested_profile = profiles::gamepad_profile(kind).value();
+    return effective_uinput_profile(requested_profile).value_or(requested_profile);
+  }
+
   LinuxUhidRoundTripResult linux_switch_pro_uhid_socketpair_reports() {
     LinuxUhidRoundTripResult result;
     std::array<int, 2> descriptors {-1, -1};
@@ -1598,7 +1775,7 @@ namespace lvh::detail::test {
 
     CreateGamepadOptions options;
     options.profile = profiles::switch_pro();
-    options.metadata.stable_id = "libvirtualhid-switch-pro-roundtrip";
+    options.metadata.stable_id = "streaming-host-gamepad-0";
 
     UhidGamepad gamepad {descriptors[0]};
     auto event = create_started_profile_uhid_gamepad(gamepad, 12, options, descriptors[1], BUS_BLUETOOTH, result);
@@ -1671,7 +1848,7 @@ namespace lvh::detail::test {
 
     CreateGamepadOptions options;
     options.profile = profiles::dualsense_usb();
-    options.profile.name = "Sunshine (libvirtualhid) PS5 Controller";
+    options.profile.name = "libvirtualhid PS5 Controller";
     options.metadata.stable_id = "02:03:04:05:06:07";
 
     UhidGamepad gamepad {descriptors[0]};
@@ -1765,7 +1942,7 @@ namespace lvh::detail::test {
 
     CreateGamepadOptions options;
     options.profile = profiles::dualsense_bluetooth();
-    options.profile.name = "Sunshine (libvirtualhid) PS5 Controller";
+    options.profile.name = "libvirtualhid PS5 Controller";
     options.metadata.stable_id = "02:03:04:05:06:07";
 
     UhidGamepad gamepad {descriptors[0]};
@@ -1849,7 +2026,7 @@ namespace lvh::detail::test {
 
     CreateGamepadOptions options;
     options.profile = profiles::dualshock4_usb();
-    options.profile.name = "Sunshine (libvirtualhid) PS4 Controller";
+    options.profile.name = "libvirtualhid PS4 Controller";
     options.metadata.stable_id = "02:03:04:05:06:07";
 
     UhidGamepad gamepad {descriptors[0]};
@@ -1933,7 +2110,7 @@ namespace lvh::detail::test {
 
     CreateGamepadOptions options;
     options.profile = profiles::dualshock4_bluetooth();
-    options.profile.name = "Sunshine (libvirtualhid) PS4 Controller";
+    options.profile.name = "libvirtualhid PS4 Controller";
     options.metadata.stable_id = "02:03:04:05:06:07";
 
     UhidGamepad gamepad {descriptors[0]};
@@ -2001,7 +2178,7 @@ namespace lvh::detail::test {
     result.capabilities = backend.capabilities();
 
     CreateGamepadOptions gamepad_options;
-    gamepad_options.profile = profiles::xbox_series();
+    gamepad_options.profile = profiles::xbox_360();
     gamepad_options.metadata.stable_id = "fake-linux-gamepad";
     auto gamepad = backend.create_gamepad(1, gamepad_options);
     result.gamepad_status = gamepad.status;

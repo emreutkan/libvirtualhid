@@ -103,6 +103,54 @@ namespace lvh::detail {
     namespace ps = playstation_feature_reports;
     constexpr auto playstation_periodic_report_ms = 10;
     constexpr auto uhid_start_timeout = std::chrono::seconds {5};
+
+    constexpr std::uint8_t gip_flag_system = 0x20;
+    constexpr std::uint8_t gip_command_hello = 0x02;
+    constexpr std::uint8_t gip_command_metadata = 0x04;
+    constexpr std::uint8_t gip_command_set_device_state = 0x05;
+    constexpr std::uint8_t gip_command_guide_button = 0x07;
+    constexpr std::uint8_t gip_command_direct_motor = 0x09;
+    constexpr std::uint8_t gip_command_input = 0x20;
+    constexpr std::uint8_t gip_device_state_start = 0x00;
+    constexpr std::uint8_t gip_device_state_reset = 0x07;
+    constexpr std::uint8_t gip_guide_virtual_key = 0x5B;
+
+    // Xbox USB controllers carry GIP packets rather than ordinary HID reports.
+    // UHID still needs a descriptor to create the hidraw transport. SDL admits
+    // only joystick/gamepad application collections to its HIDAPI gamepad
+    // drivers, so wrap opaque vendor reports in a Game Pad collection without
+    // describing generic buttons or axes that Linux could misinterpret.
+    constexpr std::array<std::uint8_t, 29> xbox_gip_uhid_report_descriptor {
+      0x05,
+      0x01,  // Usage Page (Generic Desktop)
+      0x09,
+      0x05,  // Usage (Game Pad)
+      0xA1,
+      0x01,  // Collection (Application)
+      0x06,
+      0x00,
+      0xFF,  // Usage Page (Vendor Defined)
+      0x15,
+      0x00,  // Logical Minimum (0)
+      0x26,
+      0xFF,
+      0x00,  // Logical Maximum (255)
+      0x75,
+      0x08,  // Report Size (8)
+      0x95,
+      0x40,  // Report Count (64)
+      0x09,
+      0x01,  // Usage (1)
+      0x81,
+      0x02,  // Input (Data, Variable, Absolute)
+      0x95,
+      0x40,  // Report Count (64)
+      0x09,
+      0x02,  // Usage (2)
+      0x91,
+      0x02,  // Output (Data, Variable, Absolute)
+      0xC0,  // End Collection
+    };
 #endif
 
     int system_access(const char *path, int mode) {
@@ -239,6 +287,10 @@ namespace lvh::detail {
     bool is_playstation_profile(GamepadProfileKind kind) {
       return kind == GamepadProfileKind::dualshock4 || kind == GamepadProfileKind::dualsense;
     }
+
+    bool is_xbox_gip_profile(GamepadProfileKind kind) {
+      return kind == GamepadProfileKind::xbox_one || kind == GamepadProfileKind::xbox_series;
+    }
 #endif
 
     bool uses_uinput_gamepad_profile(GamepadProfileKind kind) {
@@ -262,6 +314,226 @@ namespace lvh::detail {
 
       return false;
     }
+
+#if defined(__linux__)
+    bool prefers_uhid_gamepad_profile(GamepadProfileKind kind) {
+      switch (kind) {
+        using enum GamepadProfileKind;
+
+        case switch_pro:
+        case dualshock4:
+        case dualsense:
+        case xbox_one:
+        case xbox_series:
+          return true;
+        case generic:
+        case xbox_360:
+          return false;
+      }
+
+      return false;
+    }
+
+    DeviceProfile uhid_transport_profile(const DeviceProfile &requested_profile) {
+      auto transport_profile = requested_profile;
+      if (is_xbox_gip_profile(requested_profile.gamepad_kind)) {
+        transport_profile.report_id = 0;
+        transport_profile.input_report_size = 64;
+        transport_profile.output_report_size = 64;
+        transport_profile.report_descriptor.assign(
+          xbox_gip_uhid_report_descriptor.begin(),
+          xbox_gip_uhid_report_descriptor.end()
+        );
+      }
+      return transport_profile;
+    }
+
+    struct GipPacketView {
+      std::uint8_t command = 0;
+      std::uint8_t flags = 0;
+      std::uint8_t sequence = 0;
+      std::span<const std::uint8_t> payload;
+    };
+
+    std::optional<GipPacketView> parse_gip_packet(std::span<const std::uint8_t> packet) {
+      if (packet.size() < 4U) {
+        return std::nullopt;
+      }
+
+      std::size_t offset = 3U;
+      std::size_t payload_size = 0;
+      unsigned int shift = 0;
+      while (offset < packet.size() && shift < std::numeric_limits<std::size_t>::digits) {
+        const auto length_byte = packet[offset++];
+        payload_size |= static_cast<std::size_t>(length_byte & 0x7FU) << shift;
+        if ((length_byte & 0x80U) == 0U) {
+          if (payload_size > packet.size() - offset) {
+            return std::nullopt;
+          }
+          return GipPacketView {
+            .command = packet[0],
+            .flags = packet[1],
+            .sequence = packet[2],
+            .payload = packet.subspan(offset, payload_size),
+          };
+        }
+        shift += 7U;
+      }
+      return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> make_gip_packet(
+      std::uint8_t command,
+      std::uint8_t flags,
+      std::uint8_t sequence,
+      std::span<const std::uint8_t> payload
+    ) {
+      std::vector<std::uint8_t> packet;
+      packet.reserve(4U + payload.size());
+      packet.push_back(command);
+      packet.push_back(flags);
+      packet.push_back(sequence);
+
+      auto remaining = payload.size();
+      do {
+        auto length_byte = static_cast<std::uint8_t>(remaining & 0x7FU);
+        remaining >>= 7U;
+        if (remaining != 0U) {
+          length_byte |= 0x80U;
+        }
+        packet.push_back(length_byte);
+      } while (remaining != 0U);
+
+      packet.insert(packet.end(), payload.begin(), payload.end());
+      return packet;
+    }
+
+    std::uint16_t read_u16_le(std::span<const std::uint8_t> report, std::size_t offset) {
+      return static_cast<std::uint16_t>(report[offset]) |
+             static_cast<std::uint16_t>(static_cast<std::uint16_t>(report[offset + 1U]) << 8U);
+    }
+
+    void append_u16_le(std::vector<std::uint8_t> &report, std::uint16_t value) {
+      report.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+      report.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
+    }
+
+    std::vector<std::uint8_t> make_xbox_gip_input_packet(
+      const GamepadState &state,
+      std::span<const std::uint8_t> packed_report,
+      std::uint8_t sequence
+    ) {
+      if (packed_report.size() < 17U) {
+        return {};
+      }
+
+      using enum GamepadButton;
+      std::vector<std::uint8_t> payload(6U, 0);
+      payload[0] = static_cast<std::uint8_t>(
+        (state.buttons.test(start) ? 0x04U : 0U) | (state.buttons.test(back) ? 0x08U : 0U) |
+        (state.buttons.test(a) ? 0x10U : 0U) | (state.buttons.test(b) ? 0x20U : 0U) |
+        (state.buttons.test(x) ? 0x40U : 0U) | (state.buttons.test(y) ? 0x80U : 0U)
+      );
+      payload[1] = static_cast<std::uint8_t>(
+        (state.buttons.test(dpad_up) ? 0x01U : 0U) | (state.buttons.test(dpad_down) ? 0x02U : 0U) |
+        (state.buttons.test(dpad_left) ? 0x04U : 0U) | (state.buttons.test(dpad_right) ? 0x08U : 0U) |
+        (state.buttons.test(left_shoulder) ? 0x10U : 0U) | (state.buttons.test(right_shoulder) ? 0x20U : 0U) |
+        (state.buttons.test(left_stick) ? 0x40U : 0U) | (state.buttons.test(right_stick) ? 0x80U : 0U)
+      );
+
+      payload[2] = packed_report[8];
+      payload[3] = packed_report[9];
+      payload[4] = packed_report[10];
+      payload[5] = packed_report[11];
+      for (const auto packed_offset : {0U, 2U, 4U, 6U}) {
+        const auto axis = static_cast<std::uint16_t>(read_u16_le(packed_report, packed_offset) - 0x8000U);
+        append_u16_le(payload, axis);
+      }
+
+      return make_gip_packet(gip_command_input, 0, sequence, payload);
+    }
+
+    std::vector<std::uint8_t> make_xbox_gip_guide_packet(bool pressed, std::uint8_t sequence) {
+      const std::array payload {static_cast<std::uint8_t>(pressed ? 1U : 0U), gip_guide_virtual_key};
+      return make_gip_packet(gip_command_guide_button, gip_flag_system, sequence, payload);
+    }
+
+    std::vector<std::uint8_t> make_xbox_gip_hello_packet(
+      DeviceId id,
+      const DeviceProfile &profile,
+      std::uint8_t sequence
+    ) {
+      std::array<std::uint8_t, 28> payload {};
+      for (std::size_t index = 0; index < sizeof(id); ++index) {
+        payload[index] = static_cast<std::uint8_t>((id >> (index * 8U)) & 0xFFU);
+      }
+      payload[8] = static_cast<std::uint8_t>(profile.vendor_id & 0xFFU);
+      payload[9] = static_cast<std::uint8_t>(profile.vendor_id >> 8U);
+      payload[10] = static_cast<std::uint8_t>(profile.product_id & 0xFFU);
+      payload[11] = static_cast<std::uint8_t>(profile.product_id >> 8U);
+      payload[12] = 1;
+      payload[20] = 1;
+      payload[22] = 1;
+      payload[24] = 1;
+      payload[26] = 1;
+      return make_gip_packet(gip_command_hello, gip_flag_system, sequence, payload);
+    }
+
+    std::vector<std::uint8_t> make_xbox_gip_metadata_packet(std::uint8_t sequence) {
+      constexpr std::array<std::uint8_t, 48> metadata {
+        0x10,
+        0x00,  // Metadata header size.
+        0x01,
+        0x00,  // Metadata version 1.0.
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x30,
+        0x00,  // Complete metadata size.
+        0x10,
+        0x00,  // Device metadata size; optional sections are empty.
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x01,  // One vendor-message declaration.
+        0x0F,
+        0x00,  // Declaration size.
+        gip_command_direct_motor,
+        0x09,
+        0x00,  // Direct-motor payload size.
+        0x01,
+        0x00,  // Custom data type.
+        0x08,
+        0x00,
+        0x00,
+        0x00,  // Downstream (host-to-controller).
+        0x00,
+        0x00,  // Period.
+        0x00,
+        0x00,  // Persistence timeout.
+      };
+      return make_gip_packet(gip_command_metadata, gip_flag_system, sequence, metadata);
+    }
+
+#endif
 
     std::optional<int> uinput_misc1_button(GamepadProfileKind kind) {
       switch (kind) {
@@ -303,9 +575,10 @@ namespace lvh::detail {
 #if defined(__linux__)
     std::uint16_t to_uhid_bus(const DeviceProfile &profile) {
       // Linux SDL2 HIDAPI requires BUS_USB hidraw devices to have a physical USB
-      // parent in sysfs. UHID devices do not, so expose Switch Pro through the
-      // Bluetooth HID path that accepts descriptor-driven virtual devices.
-      if (profile.gamepad_kind == GamepadProfileKind::switch_pro) {
+      // parent in sysfs. UHID devices do not, so expose transports handled by
+      // HIDAPI through the Bluetooth HID enumeration path. Xbox still uses its
+      // wired GIP protocol because SDL selects that protocol from its VID/PID.
+      if (profile.gamepad_kind == GamepadProfileKind::switch_pro || is_xbox_gip_profile(profile.gamepad_kind)) {
         return BUS_BLUETOOTH;
       }
       return to_uhid_bus(profile.bus_type);
@@ -319,6 +592,13 @@ namespace lvh::detail {
         return "Wireless Controller";
       }
       return profile.name;
+    }
+
+    std::string uhid_profile_scoped_id(
+      const DeviceProfile &profile,
+      std::string_view stable_id
+    ) {
+      return std::format("{:04x}:{:04x}/{}", profile.vendor_id, profile.product_id, stable_id);
     }
 #endif
 
@@ -2794,29 +3074,41 @@ namespace lvh::detail {
       OperationStatus create(DeviceId id, const CreateGamepadOptions &options) {
         uhid_event event {};
         auto &request = event.u.create2;
+        const auto transport_profile = uhid_transport_profile(options.profile);
 
-        if (options.profile.report_descriptor.size() > sizeof(request.rd_data)) {
+        if (transport_profile.report_descriptor.size() > sizeof(request.rd_data)) {
           return OperationStatus::failure(ErrorCode::unsupported_profile, "HID report descriptor is too large for UHID");
         }
 
         event.type = UHID_CREATE2;
-        unique_id_ = options.metadata.stable_id.empty() ? std::to_string(id) : options.metadata.stable_id;
-        if (is_playstation_profile(options.profile.gamepad_kind)) {
+        const auto stable_id = options.metadata.stable_id.empty() ? std::to_string(id) : options.metadata.stable_id;
+        unique_id_ = uhid_profile_scoped_id(transport_profile, stable_id);
+        if (is_playstation_profile(transport_profile.gamepad_kind)) {
           playstation_mac_address_ = parse_mac_address(options.metadata.stable_id).value_or(generated_mac_address(id));
           unique_id_ = format_mac_address(playstation_mac_address_);
         }
-        physical_id_ = std::format("libvirtualhid/uhid/{}", id);
+        physical_id_ = std::format(
+          "libvirtualhid/uhid/{:04x}:{:04x}/{}",
+          transport_profile.vendor_id,
+          transport_profile.product_id,
+          id
+        );
 
-        device_name_ = uhid_gamepad_name(options.profile);
+        device_name_ = uhid_gamepad_name(transport_profile);
         copy_string(request.name, device_name_);
         copy_string(request.phys, physical_id_);
         copy_string(request.uniq, unique_id_);
-        request.rd_size = static_cast<std::uint16_t>(options.profile.report_descriptor.size());
-        request.bus = to_uhid_bus(options.profile);
-        request.vendor = options.profile.vendor_id;
-        request.product = options.profile.product_id;
-        request.version = options.profile.version;
-        std::memcpy(request.rd_data, options.profile.report_descriptor.data(), options.profile.report_descriptor.size());
+        request.rd_size = static_cast<std::uint16_t>(transport_profile.report_descriptor.size());
+        request.bus = to_uhid_bus(transport_profile);
+        request.vendor = transport_profile.vendor_id;
+        request.product = transport_profile.product_id;
+        request.version = transport_profile.version;
+        std::memcpy(
+          request.rd_data,
+          transport_profile.report_descriptor.data(),
+          transport_profile.report_descriptor.size()
+        );
+        device_id_ = id;
         profile_ = options.profile;
         {
           std::lock_guard lock {state_mutex_};
@@ -2856,7 +3148,16 @@ namespace lvh::detail {
         const std::vector<std::uint8_t> &report
       ) override {
         std::lock_guard lock {state_mutex_};
-        auto status = write_input_report(report);
+        if (is_xbox_gip_profile(profile_.gamepad_kind) && state.buttons.test(GamepadButton::guide) != last_state_.buttons.test(GamepadButton::guide)) {
+          if (const auto status = write_input_report(make_xbox_gip_guide_packet(state.buttons.test(GamepadButton::guide), next_gip_sequence(gip_system_sequence_))); !status.ok()) {
+            return status;
+          }
+        }
+
+        const auto transport_report = is_xbox_gip_profile(profile_.gamepad_kind) ?
+                                        make_xbox_gip_input_packet(state, report, next_gip_sequence(gip_input_sequence_)) :
+                                        report;
+        auto status = write_input_report(transport_report);
         if (status.ok()) {
           last_state_ = state;
         }
@@ -3009,6 +3310,11 @@ namespace lvh::detail {
             }
             lifecycle_condition_.notify_all();
             break;
+          case UHID_OPEN:
+            if (is_xbox_gip_profile(profile_.gamepad_kind)) {
+              static_cast<void>(send_xbox_gip_hello());
+            }
+            break;
           case UHID_OUTPUT:
             dispatch_output_report(event.u.output.data, event.u.output.size);
             break;
@@ -3061,8 +3367,66 @@ namespace lvh::detail {
       void dispatch_output_report(const __u8 *data, std::size_t report_size) {
         const auto size = std::min<std::size_t>(report_size, UHID_DATA_MAX);
         std::vector<std::uint8_t> report(data, data + size);
+        if (is_xbox_gip_profile(profile_.gamepad_kind)) {
+          handle_xbox_gip_output(report);
+          return;
+        }
         send_switch_pro_reply(report);
         dispatch_output_report(report);
+      }
+
+      static std::uint8_t next_gip_sequence(std::atomic_uint8_t &sequence) {
+        auto result = sequence.fetch_add(1U);
+        if (result == 0U) {
+          result = sequence.fetch_add(1U);
+        }
+        return result;
+      }
+
+      OperationStatus send_xbox_gip_hello() {
+        return write_input_report(make_xbox_gip_hello_packet(
+          device_id_,
+          profile_,
+          next_gip_sequence(gip_system_sequence_)
+        ));
+      }
+
+      OperationStatus send_current_xbox_gip_state() {
+        std::lock_guard lock {state_mutex_};
+        const auto report = reports::pack_input_report(profile_, last_state_);
+        return write_input_report(make_xbox_gip_input_packet(
+          last_state_,
+          report,
+          next_gip_sequence(gip_input_sequence_)
+        ));
+      }
+
+      void handle_xbox_gip_output(const std::vector<std::uint8_t> &report) {
+        const auto packet = parse_gip_packet(report);
+        if (!packet.has_value()) {
+          return;
+        }
+
+        const auto is_system = (packet->flags & gip_flag_system) != 0U;
+        if (is_system && packet->command == gip_command_metadata && packet->payload.empty()) {
+          static_cast<void>(write_input_report(make_xbox_gip_metadata_packet(packet->sequence)));
+          return;
+        }
+
+        if (is_system && packet->command == gip_command_set_device_state && !packet->payload.empty()) {
+          if (packet->payload.front() == gip_device_state_reset) {
+            static_cast<void>(send_xbox_gip_hello());
+          } else if (packet->payload.front() == gip_device_state_start) {
+            static_cast<void>(send_current_xbox_gip_state());
+          }
+          return;
+        }
+
+        if (!is_system && packet->command == gip_command_direct_motor && packet->payload.size() >= 9U) {
+          const auto motor_payload = packet->payload.subspan(1U, 8U);
+          const std::vector<std::uint8_t> pid_report(motor_payload.begin(), motor_payload.end());
+          dispatch_output_report(pid_report);
+        }
       }
 
       void send_switch_pro_reply(const std::vector<std::uint8_t> &report) {
@@ -3184,6 +3548,7 @@ namespace lvh::detail {
       }
 
       int fd_ = -1;
+      DeviceId device_id_ = 0;
       DeviceProfile profile_;
       std::string device_name_;
       std::string physical_id_;
@@ -3202,13 +3567,16 @@ namespace lvh::detail {
       std::mutex state_mutex_;
       std::mutex callback_mutex_;
       OutputCallback output_callback_;
+      std::atomic_uint8_t gip_input_sequence_ {1};
+      std::atomic_uint8_t gip_system_sequence_ {1};
     };
 #endif
 
     std::optional<DeviceProfile> effective_uinput_profile(const DeviceProfile &requested_profile) {
-#if defined(__FreeBSD__)
       auto effective_profile = requested_profile;
+#if defined(__FreeBSD__)
       effective_profile.output_report_size = 0;
+      effective_profile.capabilities.supports_trigger_rumble = false;
       effective_profile.capabilities.supports_motion = false;
       effective_profile.capabilities.supports_touchpad = false;
       effective_profile.capabilities.supports_rgb_led = false;
@@ -3217,8 +3585,11 @@ namespace lvh::detail {
       effective_profile.capabilities.supports_player_leds = false;
       return effective_profile;
 #else
-      static_cast<void>(requested_profile);
-      return std::nullopt;
+      if (!effective_profile.capabilities.supports_trigger_rumble) {
+        return std::nullopt;
+      }
+      effective_profile.capabilities.supports_trigger_rumble = false;
+      return effective_profile;
 #endif
     }
 
@@ -3252,6 +3623,24 @@ namespace lvh::detail {
       }
 
       BackendGamepadCreationResult create_gamepad(DeviceId id, const CreateGamepadOptions &options) override {
+#if defined(__linux__)
+        if (prefers_uhid_gamepad_profile(options.profile.gamepad_kind)) {
+          const auto fd = system_open(uhid_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+          if (fd >= 0) {
+            auto gamepad = std::make_unique<UhidGamepad>(fd);
+            if (const auto status = gamepad->create(id, options); status.ok()) {
+              return {OperationStatus::success(), std::move(gamepad)};
+            } else if (!uses_uinput_gamepad_profile(options.profile.gamepad_kind)) {
+              static_cast<void>(gamepad->close());
+              return {status, nullptr};
+            }
+            static_cast<void>(gamepad->close());
+          } else if (!uses_uinput_gamepad_profile(options.profile.gamepad_kind)) {
+            return {system_error_status(ErrorCode::backend_unavailable, "failed to open /dev/uhid", errno), nullptr};
+          }
+        }
+#endif
+
         if (uses_uinput_gamepad_profile(options.profile.gamepad_kind)) {
           const auto fd = open_uinput(O_RDWR | O_CLOEXEC | O_NONBLOCK);
           if (fd < 0) {
@@ -3270,24 +3659,13 @@ namespace lvh::detail {
           };
         }
 
-#if defined(__linux__)
-        const auto fd = system_open(uhid_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-        if (fd < 0) {
-          return {system_error_status(ErrorCode::backend_unavailable, "failed to open /dev/uhid", errno), nullptr};
-        }
-
-        auto gamepad = std::make_unique<UhidGamepad>(fd);
-        if (const auto status = gamepad->create(id, options); !status.ok()) {
-          static_cast<void>(gamepad->close());
-          return {status, nullptr};
-        }
-
-        return {OperationStatus::success(), std::move(gamepad)};
-#else
+#if defined(__FreeBSD__)
         return {
           OperationStatus::failure(ErrorCode::unsupported_profile, "gamepad profile requires Linux UHID"),
           nullptr,
         };
+#else
+        return {OperationStatus::failure(ErrorCode::unsupported_profile, "unsupported gamepad profile"), nullptr};
 #endif
       }
 

@@ -67,6 +67,7 @@ namespace {
     int minimum_buttons = 1;
     int minimum_axes = 2;
     bool require_sdl_rumble = false;
+    bool require_trigger_rumble = false;
     bool require_motion = false;
     bool expect_live_input = true;
   };
@@ -202,7 +203,10 @@ namespace {
   struct RumbleState {
     std::atomic_uint16_t low_frequency {0};
     std::atomic_uint16_t high_frequency {0};
-    std::atomic_bool observed {false};
+    std::atomic_uint16_t left_trigger {0};
+    std::atomic_uint16_t right_trigger {0};
+    std::atomic_bool ordinary_observed {false};
+    std::atomic_bool trigger_observed {false};
   };
 
   std::shared_ptr<RumbleState> observe_rumble(lvh::Gamepad &gamepad) {
@@ -214,21 +218,31 @@ namespace {
       ) {
         rumble->low_frequency = output.low_frequency_rumble;
         rumble->high_frequency = output.high_frequency_rumble;
-        rumble->observed = true;
+        rumble->ordinary_observed = true;
+      } else if (
+        output.kind == lvh::GamepadOutputKind::trigger_rumble &&
+        output.left_trigger_rumble > 0 && output.right_trigger_rumble > 0
+      ) {
+        rumble->left_trigger = output.left_trigger_rumble;
+        rumble->right_trigger = output.right_trigger_rumble;
+        rumble->trigger_observed = true;
       }
     });
     return rumble;
   }
 
-  bool wait_for_rumble(const std::shared_ptr<RumbleState> &rumble, bool pump_sdl) {
+  bool wait_for_rumble(const std::shared_ptr<RumbleState> &rumble, bool pump_sdl, bool trigger = false) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {3};
-    while (std::chrono::steady_clock::now() < deadline && !rumble->observed.load()) {
+    const auto observed = [&rumble, trigger]() {
+      return trigger ? rumble->trigger_observed.load() : rumble->ordinary_observed.load();
+    };
+    while (std::chrono::steady_clock::now() < deadline && !observed()) {
       if (pump_sdl) {
         pump_sdl_events();
       }
       std::this_thread::sleep_for(std::chrono::milliseconds {20});
     }
-    return rumble->observed.load();
+    return observed();
   }
 
   std::optional<std::filesystem::path> wait_for_hidraw_node(const lvh::Gamepad &gamepad) {
@@ -477,6 +491,8 @@ namespace {
   void configure_sdl_hidapi_hints() {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI", "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_XBOX", "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_XBOX_ONE", "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS4", "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS4_RUMBLE", "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS5", "1");
@@ -562,13 +578,28 @@ namespace {
     }
   }
 
-  void expect_sdl_rumble_callback(SDL_GameController *controller, lvh::Gamepad &gamepad) {
+  void expect_sdl_rumble_callback(
+    SDL_GameController *controller,
+    lvh::Gamepad &gamepad,
+    bool require_trigger_rumble = false
+  ) {
     const auto rumble = observe_rumble(gamepad);
 
     ASSERT_EQ(SDL_GameControllerRumble(controller, 0x5678, 0x1234, 1000), 0) << SDL_GetError();
     EXPECT_TRUE(wait_for_rumble(rumble, true));
     EXPECT_GT(rumble->low_frequency.load(), 0);
     EXPECT_GT(rumble->high_frequency.load(), 0);
+
+    if (require_trigger_rumble) {
+      auto *joystick = SDL_GameControllerGetJoystick(controller);
+      ASSERT_NE(joystick, nullptr);
+      ASSERT_EQ(SDL_JoystickHasRumbleTriggers(joystick), SDL_TRUE)
+        << "SDL did not expose the Xbox impulse motors";
+      ASSERT_EQ(SDL_GameControllerRumbleTriggers(controller, 0x3456, 0x789A, 1000), 0) << SDL_GetError();
+      EXPECT_TRUE(wait_for_rumble(rumble, true, true));
+      EXPECT_GT(rumble->left_trigger.load(), 0);
+      EXPECT_GT(rumble->right_trigger.load(), 0);
+    }
   }
 
   void expect_sdl_motion_input(SDL_GameController *controller, lvh::Gamepad &gamepad) {
@@ -772,7 +803,7 @@ namespace {
     if (test_case.require_motion) {
       expect_sdl_motion_input(controller.get(), gamepad);
     }
-    expect_sdl_rumble_callback(controller.get(), gamepad);
+    expect_sdl_rumble_callback(controller.get(), gamepad, test_case.require_trigger_rumble);
   }
 
   void run_sdl_canonical_gamepad_test(const SdlGamepadConsumerCase &test_case) {
@@ -883,28 +914,32 @@ TEST_F(LinuxConsumerTest, SdlSeesXbox360CanonicalButtons) {
 }
 
 TEST_F(LinuxConsumerTest, SdlSeesXboxOneCanonicalButtons) {
-  ASSERT_TRUE(HasReadableWritableDeviceNode("/dev/uinput"));
+  ASSERT_TRUE(HasReadableWritableDeviceNode("/dev/uhid"));
 
   run_sdl_canonical_gamepad_test({
     .profile = lvh::profiles::xbox_one(),
     .name_suffix = "SDL Xbox One",
     .stable_id = "libvirtualhid-sdl-xbox-one-test",
-    .expected_product_id = 0x0B20,
+    .expected_product_id = 0x02EA,
     .minimum_buttons = 15,
     .minimum_axes = 6,
+    .require_sdl_rumble = true,
+    .require_trigger_rumble = true,
   });
 }
 
 TEST_F(LinuxConsumerTest, SdlSeesXboxSeriesCanonicalButtons) {
-  ASSERT_TRUE(HasReadableWritableDeviceNode("/dev/uinput"));
+  ASSERT_TRUE(HasReadableWritableDeviceNode("/dev/uhid"));
 
   const SdlGamepadConsumerCase test_case {
     .profile = lvh::profiles::xbox_series(),
     .name_suffix = "SDL Xbox Series",
     .stable_id = "libvirtualhid-sdl-xbox-series-test",
-    .expected_product_id = 0x0B13,
+    .expected_product_id = 0x0B12,
     .minimum_buttons = 16,
     .minimum_axes = 6,
+    .require_sdl_rumble = true,
+    .require_trigger_rumble = true,
   };
   run_sdl_canonical_gamepad_test(test_case);
 }

@@ -109,30 +109,49 @@ and signing details.
 
 The Linux backend uses standard user-space kernel interfaces:
 
-- `uhid` for descriptor-driven PlayStation and Switch Pro gamepads.
-- `uinput` for Generic, Xbox 360, Xbox One, and Xbox Series gamepads, plus
-  keyboard, mouse, touchscreen, trackpad, and pen tablet devices.
+- `uhid` for descriptor-driven PlayStation and Switch Pro gamepads and for Xbox
+  One and Xbox Series GIP transports.
+- `uinput` for Generic and Xbox 360 gamepads, for Xbox One and Xbox Series when
+  `uhid` is unavailable, and for keyboard, mouse, touchscreen, trackpad, and pen
+  tablet devices.
 - `libevdev` internally for uinput device construction.
 - X11/XTest only as a keyboard and mouse fallback when `uinput` cannot be used
   and an X11 session is available.
 
 Gamepad support normally prefers `uhid` because descriptors, raw HID identity,
-feature reports, and output reports matter for controller compatibility.
-Generic and Xbox-family profiles instead use `uinput` so SDL,
-Steam, browser Gamepad API implementations, and other evdev consumers receive
-canonical Linux gamepad events. Face buttons, shoulders, menu buttons, stick
-clicks, and Guide use their native evdev codes; sticks use absolute axes. Every
-uinput gamepad exposes its directional pad through `ABS_HAT0X` and `ABS_HAT0Y`.
-Generic and Xbox triggers remain independent analog `ABS_Z` and `ABS_RZ` axes.
-Profiles with rumble support normalize rumble, constant, periodic, and ramp
-uinput force-feedback effects back into the public callback. Each requested playback repetition
-restarts the effect's ramp and envelope timing. A zero-length effect remains
-active until its explicit stop event, matching the infinite-effect contract used
-by SDL and Steam. The Linux backend lets a new uinput device settle before
-reading those effects, so an early poll error cannot disable feedback for the
-device lifetime. Generated UHID nodes are correlated by stable physical and
-unique identifiers when available, with device-name matching used only as a
-fallback. PlayStation rumble is read from native UHID interrupt-channel output
+feature reports, and output reports matter for controller compatibility. Xbox
+One and Xbox Series use a minimal Game Pad application collection containing
+only opaque vendor reports to create a `hidraw` transport. The application usage
+allows HIDAPI gamepad drivers to discover the device, while the absence of
+generic button and axis fields prevents Linux from interpreting the GIP payload
+as an unrelated evdev controller. Controller identity, initialization, input,
+Guide, and four-motor output are carried as Game Input Protocol (GIP) packets,
+allowing HIDAPI consumers to expose both ordinary and trigger rumble.
+The UHID transport is tagged as Bluetooth because Linux HIDAPI implementations
+require a physical USB parent for `BUS_USB` hidraw devices, which a user-space
+UHID device cannot provide. The Microsoft vendor/product identity still selects
+SDL's wired GIP parser and does not change the public profile's USB identity.
+
+Generic and Xbox 360 profiles use `uinput` so SDL, Steam, browser Gamepad API
+implementations, and other evdev consumers receive canonical Linux gamepad
+events. Xbox One and Xbox Series use the same path only as a fallback when
+`/dev/uhid` cannot be opened or initialized. Face buttons, shoulders, menu
+buttons, stick clicks, and Guide use their native evdev codes; sticks use
+absolute axes. Every uinput gamepad exposes its directional pad through
+`ABS_HAT0X` and `ABS_HAT0Y`. Generic and Xbox triggers remain independent analog
+`ABS_Z` and `ABS_RZ` axes. Profiles with rumble support normalize rumble,
+constant, periodic, and ramp uinput force-feedback effects back into the public
+callback. Each requested playback repetition restarts the effect's ramp and
+envelope timing. A zero-length effect remains active until its explicit stop
+event, matching the infinite-effect contract used by SDL and Steam. The Linux
+backend lets a new uinput device settle before reading those effects, so an
+early poll error cannot disable feedback for the device lifetime.
+
+Generated UHID nodes are correlated by stable physical and unique identifiers
+when available, with device-name matching used only as a fallback. UHID
+identities include the virtual profile's vendor and product IDs so applications
+do not reuse metadata from another profile after the same virtual slot changes
+profiles. PlayStation rumble is read from native UHID interrupt-channel output
 reports.
 
 The Generic profile keeps its public `0x1209:0x0001` identity, USB bus, and
@@ -142,16 +161,24 @@ which avoids changing the raw button capability surface. It uses a compact
 Generic button layout rather than the sparse Xbox button slots.
 
 Xbox 360 retains its `0x045E:0x028E` identity, while its Linux uinput device uses
-the Bluetooth bus, so consumers select the sparse button mapping.
-Xbox One and Xbox Series retain their public USB identities, but their Linux
-uinput devices use the corresponding Bluetooth product identities (`0x0B20`
-and `0x0B13`, respectively), whose standard consumer mappings match the events
-that uinput exposes. Those three Xbox profiles preserve the 15-slot
-Linux gamepad button sequence: unused `BTN_C`, `BTN_Z`, `BTN_TL2`, and `BTN_TR2`
-slots are advertised but never pressed, keeping face buttons, shoulders, menu
-buttons, Guide, L3, and R3 at their expected indices. D-pad directions are
-reported through the hat axes and exposed as logical buttons by standard
-gamepad consumers.
+the Bluetooth bus, so consumers select the sparse button mapping. The Xbox One
+and Xbox Series UHID transports retain their public USB identities and speak
+wired GIP over `hidraw`. They announce their identity, answer GIP metadata
+requests, send canonical low-latency input and separate Guide packets, and
+decode direct-motor output into ordinary and independent trigger-rumble
+callbacks.
+
+If UHID is unavailable, the Xbox One and Xbox Series uinput fallbacks use the
+corresponding Bluetooth product identities (`0x0B20` and `0x0B13`, respectively),
+whose standard consumer mappings match the events that uinput exposes. The Xbox
+uinput profiles preserve the 15-slot Linux gamepad button sequence: unused
+`BTN_C`, `BTN_Z`, `BTN_TL2`, and `BTN_TR2` slots are advertised but never
+pressed, keeping face buttons, shoulders, menu buttons, Guide, L3, and R3 at
+their expected indices. D-pad directions are reported through the hat axes and
+exposed as logical buttons by standard gamepad consumers. The fallback retains
+all of those controls, analog trigger input, and ordinary force feedback, but
+Linux uinput cannot expose independent trigger motors, so its effective profile
+clears trigger-rumble support.
 
 DualShock 4 and DualSense remain on `uhid` so their descriptors, motion,
 touchpad, battery, feature reports, and profile-specific output reports stay
