@@ -479,7 +479,15 @@ namespace lvh::detail {
         CGEventSetIntegerValueField(keyboard_event, kCGKeyboardEventKeycode, *key);
 
         ModifierFlags modifier_flags;
-        if (modifier_flags_for_key(*key, modifier_flags)) {
+        if (*key == kVK_CapsLock) {
+          // Caps Lock is latched by IOHIDSystem, which ignores synthetic key events, and
+          // IOHIDSetModifierLockState is a silent no-op without root. Latch the flag here so
+          // it rides along on every event we post; the host's physical LED stays dark.
+          if (event.pressed) {
+            state_->keyboard_flags ^= kCGEventFlagMaskAlphaShift;
+          }
+          CGEventSetType(keyboard_event, kCGEventFlagsChanged);
+        } else if (modifier_flags_for_key(*key, modifier_flags)) {
           if (event.pressed) {
             state_->keyboard_flags |= modifier_flags.generic | modifier_flags.device;
           } else {
