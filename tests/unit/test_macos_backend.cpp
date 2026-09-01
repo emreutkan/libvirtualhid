@@ -63,6 +63,28 @@ TEST_F(MacosBackendTest, IdentifiesModifierKeys) {
   EXPECT_FALSE(lvh::detail::test::macos_backend_is_modifier_key(0x13));
 }
 
+TEST_F(MacosBackendTest, TranslatesControlLetterToCommand) {
+  const auto flags = lvh::detail::test::macos_backend_shortcut_flags(0xA2, 0x43);
+
+  EXPECT_NE(flags & kCGEventFlagMaskCommand, 0U);
+  EXPECT_EQ(flags & kCGEventFlagMaskControl, 0U);
+}
+
+TEST_F(MacosBackendTest, PreservesControlForMissionControl) {
+  const auto flags = lvh::detail::test::macos_backend_shortcut_flags(0xA2, 0x26);
+
+  EXPECT_NE(flags & kCGEventFlagMaskControl, 0U);
+  EXPECT_EQ(flags & kCGEventFlagMaskCommand, 0U);
+}
+
+TEST_F(MacosBackendTest, PreservesShiftForEnter) {
+  const auto flags = lvh::detail::test::macos_backend_shortcut_flags(0xA0, 0x0D);
+
+  EXPECT_NE(flags & kCGEventFlagMaskShift, 0U);
+  EXPECT_EQ(flags & kCGEventFlagMaskCommand, 0U);
+  EXPECT_EQ(flags & kCGEventFlagMaskControl, 0U);
+}
+
 TEST_F(MacosBackendTest, ConvertsScrollSettings) {
   EXPECT_EQ(lvh::detail::test::macos_backend_scroll_lines_per_detent(0.0), 1);
   EXPECT_EQ(lvh::detail::test::macos_backend_scroll_lines_per_detent(0.3125), 5);

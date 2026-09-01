@@ -69,6 +69,15 @@ namespace lvh::detail::test {
   bool macos_backend_is_modifier_key(KeyboardKeyCode key_code);
 
   /**
+   * @brief Capture flags emitted for a key pressed while a modifier is held.
+   *
+   * @param modifier_key_code Portable modifier key code.
+   * @param key_code Portable key code pressed with the modifier.
+   * @return CoreGraphics flags posted for the key event.
+   */
+  std::uint64_t macos_backend_shortcut_flags(KeyboardKeyCode modifier_key_code, KeyboardKeyCode key_code);
+
+  /**
    * @brief Convert a macOS scroll-wheel scaling value to lines per detent.
    *
    * @param scale macOS scroll-wheel scaling value.

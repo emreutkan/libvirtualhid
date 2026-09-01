@@ -6,8 +6,21 @@
 // local includes
 #include "fixtures/macos_backend_test_hooks.hpp"
 
+// platform includes
+#include <ApplicationServices/ApplicationServices.h>
+
+namespace {
+  std::uint64_t posted_keyboard_flags {};
+
+  void capture_event(CGEventTapLocation /*tap*/, CGEventRef event) {
+    posted_keyboard_flags = CGEventGetFlags(event);
+  }
+}  // namespace
+
 #define create_platform_backend create_platform_backend_for_macos_backend_test_hooks
+#define CGEventPost capture_event
 #include "../../src/platform/macos/macos_backend.cpp"
+#undef CGEventPost
 #undef create_platform_backend
 
 namespace lvh::detail::test {
@@ -29,6 +42,21 @@ namespace lvh::detail::test {
 
     macos::ModifierFlags flags;
     return macos::modifier_flags_for_key(*mapped, flags);
+  }
+
+  std::uint64_t macos_backend_shortcut_flags(KeyboardKeyCode modifier_key_code, KeyboardKeyCode key_code) {
+    auto backend = create_platform_backend_for_macos_backend_test_hooks();
+    CreateKeyboardOptions options;
+    options.profile.device_type = DeviceType::keyboard;
+    auto keyboard = backend->create_keyboard(1, options);
+    if (!keyboard) {
+      return 0;
+    }
+
+    posted_keyboard_flags = 0;
+    keyboard.keyboard->submit({.key_code = modifier_key_code, .pressed = true});
+    keyboard.keyboard->submit({.key_code = key_code, .pressed = true});
+    return posted_keyboard_flags;
   }
 
   int macos_backend_scroll_lines_per_detent(double scale) {

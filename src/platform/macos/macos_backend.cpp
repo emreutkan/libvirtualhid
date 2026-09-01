@@ -285,6 +285,26 @@ namespace lvh::detail {
     }
 
     /**
+     * @brief Translate Windows-style Control-letter shortcuts to macOS Command-letter shortcuts.
+     *
+     * @param key_code Portable key code being posted.
+     * @param flags Active CoreGraphics modifier flags.
+     * @return Modifier flags for the key event.
+     */
+    inline CGEventFlags keyboard_event_flags(KeyboardKeyCode key_code, CGEventFlags flags) {
+      if (key_code < 0x41 || key_code > 0x5A || (flags & kCGEventFlagMaskControl) == 0) {
+        return flags;
+      }
+
+      ModifierFlags control_flags;
+      ModifierFlags command_flags;
+      modifier_flags_for_key(kVK_Control, control_flags);
+      modifier_flags_for_key(kVK_Command, command_flags);
+      flags &= ~(control_flags.generic | control_flags.all_devices);
+      return flags | command_flags.generic | command_flags.device;
+    }
+
+    /**
      * @brief Convert a scroll-wheel slider value to logical lines per detent.
      *
      * @param scale macOS scroll-wheel scaling preference.
@@ -501,7 +521,7 @@ namespace lvh::detail {
           CGEventSetType(keyboard_event, event.pressed ? kCGEventKeyDown : kCGEventKeyUp);
         }
 
-        CGEventSetFlags(keyboard_event, state_->keyboard_flags);
+        CGEventSetFlags(keyboard_event, keyboard_event_flags(event.key_code, state_->keyboard_flags));
         CGEventPost(kCGSessionEventTap, keyboard_event);
         CFRelease(keyboard_event);
         return OperationStatus::success();
